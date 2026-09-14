@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+"""damon-dms-watch — the OFF-PREMISES half of DAMON's dead-man's-switch.
+
+This runs OUTSIDE the house (GitHub Actions). It never connects to the fleet and
+holds no fleet credential. It only reads a public-but-unguessable heartbeat
+topic and asks one question: has ANY fleet host said "I am alive" recently?
+
+WHY SILENCE IS THE SIGNAL
+-------------------------
+Every in-house alert path shares a fate with the thing it reports on. If power,
+the ISP, or the LAN dies, an in-house alerter cannot send the one message that
+matters. So the fleet continuously asserts life outbound, and this watcher
+alarms on the ABSENCE of that assertion. A dead house cannot suppress silence.
+
+FALSE-ALARM DISCIPLINE (why this is not a timestamp comparison)
+---------------------------------------------------------------
+Absence belongs to the instrument until proven otherwise. Three rules:
+
+  1. POSITIVE CONTROL. Before reading silence as evidence, the watcher publishes
+     a canary to its own control topic and reads it back. If that round-trip
+     fails, the transport is broken and the run is VOID -> UNKNOWN, never ALARM.
+     A check that cannot distinguish "nobody spoke" from "I have gone deaf" is
+     not a check.
+  2. QUORUM. Several independent hosts heartbeat. One host going quiet is a HOST
+     problem (degraded), not a house problem. Only when EVERY expected host has
+     gone quiet does this become a fleet-level alarm.
+  3. THREE STATE. ok / degraded / alarm / unknown are distinct outcomes and
+     unknown is never rendered as ok. Failing closed here would page on every
+     ntfy hiccup and the alarm would be trained into noise.
+
+EXIT: 0 ok | 1 ALARM (all hosts silent) | 2 degraded (some silent) | 3 UNKNOWN
+"""
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+
+ENDPOINT = os.environ.get("DMS_ENDPOINT", "https://ntfy.sh")
+TOPIC = os.environ.get("DMS_TOPIC", "")
+ALARM_TOPIC = os.environ.get("DMS_ALARM_TOPIC", "")
+CONTROL_TOPIC = os.environ.get("DMS_CONTROL_TOPIC", "")
+EXPECTED = [h.strip() for h in os.environ.get(
+    "DMS_EXPECTED_HOSTS", "pc-2,ctrl-01,mac-134").split(",") if h.strip()]
+STALE = int(os.environ.get("DMS_STALE_SECONDS", "1800"))
+WINDOW = os.environ.get("DMS_WINDOW", "6h")
+TIMEOUT = float(os.environ.get("DMS_TIMEOUT", "20"))
+
+
+def _post(topic, body, title=None, priority=None, tags=None):
+    headers = {"User-Agent": "damon-dms-watch/1"}
+    if title:
+        headers["Title"] = title
+    if priority:
+        headers["Priority"] = priority
+    if tags:
+        headers["Tags"] = tags
+    req = urllib.request.Request("%s/%s" % (ENDPOINT, topic),
+                                 data=body.encode(), method="POST",
+                                 headers=headers)
+    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+        return resp.getcode()
+
+
+def _poll(topic, since):
+    url = "%s/%s/json?poll=1&since=%s" % (ENDPOINT, topic, since)
+    req = urllib.request.Request(url, headers={"User-Agent": "damon-dms-watch/1"})
+    out = []
+    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+        for line in resp.read().decode().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if row.get("event") == "message":
+                out.append(row)
+    return out
+
+
+def positive_control():
+    """Prove the transport works BEFORE reading silence as evidence.
+
+    Returns True only if a canary we just published comes back to us. Any
+    failure means the instrument is deaf, not that the fleet is dead.
+    """
+    if not CONTROL_TOPIC:
+        return None  # not configured; caller decides
+    token = "canary-%d" % int(time.time())
+    try:
+        _post(CONTROL_TOPIC, token, title="dms-canary")
+    except (urllib.error.URLError, OSError):
+        return False
+    # ntfy is fast but not instantaneous; give it a few attempts.
+    for _ in range(6):
+        time.sleep(2)
+        try:
+            rows = _poll(CONTROL_TOPIC, "5m")
+        except (urllib.error.URLError, OSError):
+            return False
+        if any(r.get("message") == token for r in rows):
+            return True
+    return False
+
+
+def main():
+    if not TOPIC:
+        print("UNKNOWN: DMS_TOPIC not configured")
+        return 3
+
+    # --- Rule 1: prove the instrument -------------------------------------
+    ctrl = positive_control()
+    if ctrl is False:
+        print("UNKNOWN: positive control FAILED (canary did not round-trip). "
+              "The transport is broken, so silence proves nothing. Run VOID; "
+              "deliberately NOT alarming.")
+        return 3
+    print("positive control: %s" % ("ok" if ctrl else "not configured"))
+
+    # --- Read the heartbeats ---------------------------------------------
+    try:
+        rows = _poll(TOPIC, WINDOW)
+    except (urllib.error.URLError, OSError) as exc:
+        print("UNKNOWN: could not read heartbeat topic (%s). Not alarming."
+              % exc.__class__.__name__)
+        return 3
+
+    now = time.time()
+    last_seen = {}
+    for r in rows:
+        msg = r.get("message", "")
+        parts = msg.split()
+        # format: "hb <host> <iso-stamp>"
+        if len(parts) >= 2 and parts[0] == "hb":
+            host = parts[1]
+            ts = r.get("time", 0)
+            if ts > last_seen.get(host, 0):
+                last_seen[host] = ts
+
+    alive, silent = [], []
+    for host in EXPECTED:
+        age = now - last_seen.get(host, 0) if host in last_seen else None
+        if age is not None and age <= STALE:
+            alive.append((host, int(age)))
+        else:
+            silent.append((host, int(age) if age is not None else None))
+
+    for host, age in alive:
+        print("  ok      %-10s last heartbeat %4ds ago" % (host, age))
+    for host, age in silent:
+        print("  SILENT  %-10s %s" % (
+            host, "last heartbeat %ds ago" % age if age is not None
+            else "no heartbeat in window %s" % WINDOW))
+
+    # --- Rule 2 + 3: quorum, three-state ----------------------------------
+    if not silent:
+        print("RESULT ok: all %d expected hosts heartbeating within %ds"
+              % (len(EXPECTED), STALE))
+        return 0
+
+    if alive:
+        print("RESULT degraded: %d/%d hosts silent, but the fleet is NOT dark "
+              "(others still heartbeating). Host problem, not a house problem."
+              % (len(silent), len(EXPECTED)))
+        return 2
+
+    # Every expected host has gone quiet. This is the event the DMS exists for.
+    detail = ("DAMON DEAD-MAN ALARM: no heartbeat from ANY of %s for >%ds. "
+              "The fleet may have lost power, internet, or the whole LAN."
+              % (",".join(EXPECTED), STALE))
+    print("RESULT ALARM: %s" % detail)
+    if ALARM_TOPIC:
+        try:
+            _post(ALARM_TOPIC, detail, title="DAMON FLEET SILENT",
+                  priority="urgent", tags="rotating_light")
+            print("alarm published to alarm topic")
+        except (urllib.error.URLError, OSError) as exc:
+            print("WARN: alarm publish failed (%s); workflow failure remains "
+                  "as the backup notification path" % exc.__class__.__name__)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

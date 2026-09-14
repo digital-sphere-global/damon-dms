@@ -1,0 +1,34 @@
+name: damon-deadman
+# The OFF-PREMISES watcher. It alarms on SILENCE from the fleet.
+# Job FAILURE is itself a notification path: GitHub emails the account owner,
+# so the alarm survives even if the ntfy publish fails.
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: check for fleet silence
+        env:
+          DMS_TOPIC: ${{ secrets.DMS_TOPIC }}
+          DMS_ALARM_TOPIC: ${{ secrets.DMS_ALARM_TOPIC }}
+          DMS_CONTROL_TOPIC: ${{ secrets.DMS_CONTROL_TOPIC }}
+          DMS_EXPECTED_HOSTS: pc-2,ctrl-01,mac-134
+          DMS_STALE_SECONDS: '1800'
+        run: |
+          set +e
+          python3 ./damon-dms-watch
+          rc=$?
+          echo "watcher_rc=$rc"
+          case $rc in
+            0) echo "::notice::fleet ok" ;;
+            1) echo "::error::DAMON DEAD-MAN ALARM - fleet silent"; exit 1 ;;
+            2) echo "::warning::degraded - some hosts silent, fleet not dark" ;;
+            3) echo "::warning::UNKNOWN - watcher could not verify; deliberately not alarming" ;;
+            *) echo "::warning::unexpected rc=$rc" ;;
+          esac
