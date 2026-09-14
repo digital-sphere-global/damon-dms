@@ -4,8 +4,13 @@ name: damon-deadman
 # so the alarm survives even if the ntfy publish fails.
 on:
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: '*/15 * * * *'
   workflow_dispatch:
+    inputs:
+      stale_seconds:
+        description: 'Staleness threshold in seconds (drill override)'
+        required: false
+        default: '1800'
 permissions:
   contents: read
 jobs:
@@ -19,7 +24,7 @@ jobs:
           DMS_ALARM_TOPIC: ${{ secrets.DMS_ALARM_TOPIC }}
           DMS_CONTROL_TOPIC: ${{ secrets.DMS_CONTROL_TOPIC }}
           DMS_EXPECTED_HOSTS: pc-2,ctrl-01,mac-134
-          DMS_STALE_SECONDS: '1800'
+          DMS_STALE_SECONDS: ${{ github.event.inputs.stale_seconds || '1800' }}
         run: |
           set +e
           python3 ./damon-dms-watch
