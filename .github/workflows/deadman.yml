@@ -4,7 +4,7 @@ name: damon-deadman
 # so the alarm survives even if the ntfy publish fails.
 on:
   schedule:
-    - cron: '*/15 * * * *'
+    - cron: '7,22,37,52 * * * *'
   workflow_dispatch:
     inputs:
       stale_seconds:
